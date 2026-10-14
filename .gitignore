@@ -1,0 +1,6 @@
+data/
+*.duckdb
+duckdb
+.venv/
+__pycache__/
+interview_answer.md

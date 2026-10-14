@@ -1,0 +1,329 @@
+]633;E;for f in sql/*.sql *.py;eee802ab-1e90-438a-a4e3-7e3a36d492aa]633;C===== sql/01_build_weekly.sql =====
+CREATE OR REPLACE TABLE sales_long AS
+UNPIVOT (
+  SELECT * FROM read_csv_auto('data/sales_train_evaluation.csv')
+  WHERE state_id = 'CA' AND cat_id = 'FOODS'
+) ON COLUMNS('d_.*') INTO NAME d VALUE sales;
+
+CREATE OR REPLACE TABLE calendar AS SELECT * FROM read_csv_auto('data/calendar.csv');
+CREATE OR REPLACE TABLE prices   AS SELECT * FROM read_csv_auto('data/sell_prices.csv');
+
+CREATE OR REPLACE TABLE weekly AS
+SELECT s.id, s.item_id, s.dept_id, s.store_id, c.wm_yr_wk,
+        CAST(MIN(c.date) AS DATE)            AS week_start,
+        COUNT(*)                             AS n_days,
+        CAST(SUM(s.sales) AS INTEGER)        AS sales,
+        SUM(c.snap_CA)                       AS snap_days,
+        MAX(c.event_name_1 IS NOT NULL)::INT AS has_event,
+        ANY_VALUE(p.sell_price)              AS price
+FROM sales_long s
+JOIN calendar c ON s.d = c.d
+LEFT JOIN prices p
+  ON p.store_id = s.store_id AND p.item_id = s.item_id AND p.wm_yr_wk = c.wm_yr_wk
+GROUP BY ALL;
+
+-- drop pre-launch rows and partial weeks
+DELETE FROM weekly WHERE price IS NULL OR n_days < 7;
+===== sql/02_features.sql =====
+CREATE OR REPLACE TABLE features AS
+SELECT *,
+  LAG(sales, 4)  OVER w AS lag_4,
+  LAG(sales, 5)  OVER w AS lag_5,
+  LAG(sales, 8)  OVER w AS lag_8,
+  LAG(sales, 13) OVER w AS lag_13,
+  LAG(sales, 52) OVER w AS lag_52,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN 7 PRECEDING AND 4 PRECEDING) = 4
+       THEN AVG(sales) OVER (w ROWS BETWEEN 7 PRECEDING AND 4 PRECEDING) END AS roll_mean_4,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN 15 PRECEDING AND 4 PRECEDING) = 12
+       THEN AVG(sales) OVER (w ROWS BETWEEN 15 PRECEDING AND 4 PRECEDING) END AS roll_mean_12,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN 15 PRECEDING AND 4 PRECEDING) = 12
+       THEN STDDEV(sales) OVER (w ROWS BETWEEN 15 PRECEDING AND 4 PRECEDING) END AS roll_std_12,
+  CASE WHEN COUNT(price) OVER (w ROWS BETWEEN 12 PRECEDING AND 1 PRECEDING) = 12
+       THEN price / AVG(price) OVER (w ROWS BETWEEN 12 PRECEDING AND 1 PRECEDING) END AS price_ratio
+FROM weekly
+WINDOW w AS (PARTITION BY id ORDER BY wm_yr_wk);
+===== sql/03_features_h.sql =====
+CREATE OR REPLACE TABLE features_h{h} AS
+SELECT id, item_id, dept_id, store_id, wm_yr_wk, sales, snap_days, has_event, price,
+  wm_yr_wk % 100 AS week_of_year,
+  LAG(sales, {h})  OVER w AS lag_r0,
+  LAG(sales, {h1}) OVER w AS lag_r1,
+  LAG(sales, {h2}) OVER w AS lag_r2,
+  LAG(sales, {h3}) OVER w AS lag_r3,
+  LAG(sales, {h7}) OVER w AS lag_r7,
+  LAG(sales, 52)   OVER w AS lag_52,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN {h3} PRECEDING AND {h} PRECEDING) = 4
+       THEN AVG(sales) OVER (w ROWS BETWEEN {h3} PRECEDING AND {h} PRECEDING) END AS roll_mean_4,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN {h11} PRECEDING AND {h} PRECEDING) = 12
+       THEN AVG(sales) OVER (w ROWS BETWEEN {h11} PRECEDING AND {h} PRECEDING) END AS roll_mean_12,
+  CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN {h11} PRECEDING AND {h} PRECEDING) = 12
+       THEN STDDEV(sales) OVER (w ROWS BETWEEN {h11} PRECEDING AND {h} PRECEDING) END AS roll_std_12,
+  CASE WHEN COUNT(price) OVER (w ROWS BETWEEN 12 PRECEDING AND 1 PRECEDING) = 12
+       THEN price / AVG(price) OVER (w ROWS BETWEEN 12 PRECEDING AND 1 PRECEDING) END AS price_ratio
+FROM weekly
+WINDOW w AS (PARTITION BY id ORDER BY wm_yr_wk);
+===== backtest_baselines.py =====
+import duckdb, numpy as np, pandas as pd
+con = duckdb.connect("m5.duckdb")
+df = con.sql("SELECT id, wm_yr_wk, sales, lag_52 FROM features").df()
+
+weeks = np.sort(df.wm_yr_wk.unique())
+H = 4
+cutoffs = [weeks[-k] for k in (17, 13, 9, 5)]
+
+def score(test, scale, col):
+    e = test.sales - test[col]
+    per_series = e.abs().groupby(test.id).mean() / scale
+    return dict(MAE=e.abs().mean(), RMSE=np.sqrt((e**2).mean()),
+                WAPE=e.abs().sum() / test.sales.sum(),
+                MASE=per_series.replace([np.inf], np.nan).mean())
+
+results, preds = [], []
+for T in cutoffs:
+    train = df[df.wm_yr_wk <= T]
+    active = train.loc[train.wm_yr_wk == T, "id"]
+    test_wks = weeks[weeks > T][:H]
+    test = df[df.wm_yr_wk.isin(test_wks) & df.id.isin(active)].copy()
+    test["h"] = test.wm_yr_wk.map({w: i + 1 for i, w in enumerate(test_wks)})   # NEW
+
+    last = train[train.wm_yr_wk == T].set_index("id").sales
+    test["naive"] = test.id.map(last)
+    test["snaive"] = test.lag_52.fillna(test.naive)
+
+    scale = train.sort_values("wm_yr_wk").groupby("id").sales.apply(lambda s: s.diff().abs().mean())
+    for m in ["naive", "snaive"]:
+        results.append({"cutoff": T, "model": m, **score(test, scale, m)})
+    test["cutoff"] = T
+    preds.append(test)
+
+res = pd.DataFrame(results)
+print(res.round(3))
+print(res.groupby("model")[["MAE", "RMSE", "WAPE", "MASE"]].mean().round(3))
+
+pd_preds = pd.concat(preds)
+con.execute("CREATE OR REPLACE TABLE preds_baseline AS SELECT * FROM pd_preds")
+
+# NEW: error by horizon
+pd_preds["e_naive"] = (pd_preds.sales - pd_preds.naive).abs()
+pd_preds["e_snaive"] = (pd_preds.sales - pd_preds.snaive).abs()
+g = pd_preds.groupby("h")
+print(pd.DataFrame({
+    "WAPE_naive": g.e_naive.sum() / g.sales.sum(),
+    "WAPE_snaive": g.e_snaive.sum() / g.sales.sum(),
+}).round(3))
+===== build_features_h.py =====
+import duckdb
+con = duckdb.connect("m5.duckdb")
+tmpl = open("sql/03_features_h.sql").read()
+for h in range(1, 5):
+    con.execute(tmpl.format(h=h, h1=h+1, h2=h+2, h3=h+3, h7=h+7, h11=h+11))
+    print(h, con.sql(f"SELECT COUNT(*) FROM features_h{h}").fetchone())
+===== build_features.py =====
+import duckdb
+con = duckdb.connect("m5.duckdb")
+con.execute(open("sql/02_features.sql").read())
+
+# spot-check: lag_4 must equal sales from 4 rows earlier
+print(con.sql("""
+SELECT wm_yr_wk, sales, lag_4, roll_mean_4, lag_52
+FROM features WHERE id = (SELECT MIN(id) FROM features)
+ORDER BY wm_yr_wk LIMIT 60
+"""))
+print(con.sql("SELECT COUNT(*) FROM features"))
+===== build.py =====
+import duckdb
+con = duckdb.connect("m5.duckdb")
+con.execute(open("sql/01_build_weekly.sql").read())
+print(con.sql("SELECT COUNT(*) FROM sales_long"))
+print(con.sql("SELECT COUNT(DISTINCT id), COUNT(*) FROM weekly"))
+===== check_gaps.py =====
+import duckdb
+con = duckdb.connect("m5.duckdb")
+print(con.sql("""
+WITH wk AS (SELECT DISTINCT wm_yr_wk, DENSE_RANK() OVER (ORDER BY wm_yr_wk) AS wk_idx FROM calendar)
+SELECT COUNT(*) AS series_with_gaps FROM (
+  SELECT w.id, MAX(wk_idx) - MIN(wk_idx) + 1 AS span, COUNT(*) AS n
+  FROM weekly w JOIN wk USING (wm_yr_wk) GROUP BY w.id
+) WHERE span <> n
+"""))
+===== evaluate_cost.py =====
+import duckdb, numpy as np, pandas as pd
+con = duckdb.connect("m5.duckdb")
+p = con.sql("""
+SELECT b.id, b.wm_yr_wk, b.cutoff, b.h, b.sales, b.lgbm, e.ets,
+       (e.ets + b.lgbm) / 2 AS ens, q.q50, q.q70, q.q90
+FROM preds_lgbm b
+JOIN preds_ets e USING (id, wm_yr_wk, cutoff)
+JOIN preds_quantile q USING (id, wm_yr_wk, cutoff)
+""").df()
+print("rows:", len(p))
+y = p.sales
+
+# 1. Calibration: does q70 actually cover ~70% of actuals?
+for a in [50, 70, 90]:
+    d = y - p[f"q{a}"]
+    pinball = np.maximum(a/100 * d, (a/100 - 1) * d).mean()
+    print(f"q{a}: coverage {(y <= p[f'q{a}']).mean():.3f} (target {a/100})  pinball {pinball:.3f}")
+
+# 2. Newsvendor cost: shortage cost cu per unit short, holding cost 1 per unit left over
+F = ["lgbm", "ets", "ens", "q50", "q70", "q90"]
+rows = []
+for cu, label in [(1, "1:1 (optimal q50)"), (7/3, "2.3:1 (optimal q70)"), (9, "9:1 (optimal q90)")]:
+    r = {"shortage:holding": label}
+    for f in F:
+        short = np.clip(y - p[f], 0, None)
+        over = np.clip(p[f] - y, 0, None)
+        r[f] = (cu * short + over).sum() / y.sum()
+    rows.append(r)
+print("\ncost per unit sold (lower is better)")
+print(pd.DataFrame(rows).set_index("shortage:holding").round(3))
+
+# 3. Service view: what each forecast means for stock
+print("\nfill rate / overstock (as share of sales)")
+print(pd.DataFrame({f: {"fill_rate": 1 - np.clip(y - p[f], 0, None).sum() / y.sum(),
+                        "overstock": np.clip(p[f] - y, 0, None).sum() / y.sum()} for f in F}).round(3))
+===== evaluate.py =====
+import duckdb, pandas as pd
+con = duckdb.connect("m5.duckdb")
+p = con.sql("""
+SELECT p.*, e.ets, COALESCE(m.ma4, p.naive) AS ma4, COALESCE(m.ma12, p.naive) AS ma12,
+       f.dept_id, f.has_event, f.price_ratio
+FROM preds_lgbm p
+JOIN preds_ets e USING (id, wm_yr_wk, cutoff)
+JOIN features_h1 f USING (id, wm_yr_wk)
+JOIN (SELECT b.id, b.cutoff, f.roll_mean_4 AS ma4, f.roll_mean_12 AS ma12
+      FROM preds_lgbm b JOIN features_h1 f USING (id, wm_yr_wk)
+      WHERE b.h = 1) m USING (id, cutoff)
+""").df()
+print("rows:", len(p))   # must be 91956
+
+# zero-sales share per series, from history BEFORE the first cutoff only
+z = con.sql("SELECT id, AVG((sales = 0)::INT) AS zero_share FROM weekly WHERE wm_yr_wk <= 11552 GROUP BY id").df()
+p = p.merge(z, on="id", how="left")
+
+p["ens"] = (p.ets + p.lgbm) / 2
+M = ["naive", "ma4", "ma12", "ets", "lgbm", "ens"]
+for m in M:
+    p["e_" + m] = (p.sales - p[m]).abs()
+cols = ["sales"] + ["e_" + m for m in M]
+
+def wape(d, ms=M):
+    return pd.Series({m: d["e_" + m].sum() / d.sales.sum() for m in ms})
+
+print(p.groupby("h")[cols].apply(wape).round(3))
+print(p.groupby("cutoff")[cols].apply(wape).round(3))
+print("overall:", wape(p).round(3).to_dict())
+print("bias:", {m: round(p[m].sum() / p.sales.sum(), 3) for m in M})
+
+# --- error analysis ---
+p["demand"] = pd.cut(p.zero_share, [-0.01, 0.1, 0.5, 1.0],
+                     labels=["<10% zeros", "10-50% zeros", ">50% zeros"]).astype(str).replace("nan", "new item")
+p["discount"] = (p.price_ratio < 0.95).map({True: "discount week", False: "normal"})
+SEG_M = ["ma4", "ets", "lgbm", "ens"]
+for seg in ["demand", "dept_id", "has_event", "discount"]:
+    t = p.groupby(seg)[cols].apply(lambda d: wape(d, SEG_M))
+    t["sales_share"] = p.groupby(seg).sales.sum() / p.sales.sum()
+    print(t.round(3))
+===== train_ets.py =====
+import duckdb, pandas as pd
+from statsforecast import StatsForecast
+from statsforecast.models import AutoETS, Naive
+con = duckdb.connect("m5.duckdb")
+
+w = con.sql("""
+SELECT id AS unique_id, wm_yr_wk, DENSE_RANK() OVER (ORDER BY wm_yr_wk) AS ds, sales::DOUBLE AS y
+FROM weekly""").df()
+keys = con.sql("SELECT DISTINCT id, cutoff FROM preds_lgbm").df()
+wk_of = dict(zip(w.ds, w.wm_yr_wk))
+
+out = []
+for T in sorted(keys.cutoff.unique()):
+    active = keys.loc[keys.cutoff == T, "id"]
+    train = w[(w.wm_yr_wk <= T) & w.unique_id.isin(active)][["unique_id", "ds", "y"]]
+    sf = StatsForecast(models=[AutoETS(season_length=1)], freq=1, n_jobs=-1,
+                       fallback_model=Naive())
+    fc = sf.forecast(df=train, h=4)
+    if "unique_id" not in fc.columns:
+        fc = fc.reset_index()
+    fc["wm_yr_wk"] = fc.ds.map(wk_of)
+    fc["cutoff"] = T
+    out.append(fc.rename(columns={"unique_id": "id", "AutoETS": "ets"})[["id", "wm_yr_wk", "cutoff", "ets"]])
+    print(T, "done")
+
+ets = pd.concat(out)
+con.execute("CREATE OR REPLACE TABLE preds_ets AS SELECT * FROM ets")
+print("rows:", len(ets))   # should be 91956
+===== train_lgbm.py =====
+import duckdb, numpy as np, pandas as pd, lightgbm as lgb
+con = duckdb.connect("m5.duckdb")
+base = con.sql("SELECT id, wm_yr_wk, cutoff, h, sales, naive FROM preds_baseline").df()
+
+FEATS = ["lag_r0", "lag_r1", "lag_r2", "lag_r3", "lag_r7", "lag_52",
+         "roll_mean_4", "roll_mean_12", "roll_std_12", "price", "price_ratio",
+         "snap_days", "has_event", "week_of_year", "store_id", "dept_id", "item_id"]
+CATS = ["store_id", "dept_id", "item_id"]
+params = dict(objective="tweedie", learning_rate=0.05, num_leaves=63,
+              min_data_in_leaf=100, feature_fraction=0.8, verbose=-1)
+
+out = []
+for h in range(1, 5):
+    df = con.sql(f"SELECT * FROM features_h{h}").df()
+    for c in CATS:
+        df[c] = df[c].astype("category")
+    for T in sorted(base.cutoff.unique()):
+        keys = base[(base.cutoff == T) & (base.h == h)][["id", "wm_yr_wk"]]
+        train = df[df.wm_yr_wk <= T]
+        test = df.merge(keys, on=["id", "wm_yr_wk"])
+        m = lgb.train(params, lgb.Dataset(train[FEATS], train.sales, categorical_feature=CATS),
+                      num_boost_round=400)
+        test["lgbm"] = m.predict(test[FEATS])
+        test["cutoff"], test["h"] = T, h
+        out.append(test[["id", "wm_yr_wk", "cutoff", "h", "lgbm"]])
+        print(f"h={h} cutoff={T} done")
+
+p = base.merge(pd.concat(out), on=["id", "wm_yr_wk", "cutoff", "h"])
+print("rows:", len(base), len(p))   # must be equal
+con.execute("CREATE OR REPLACE TABLE preds_lgbm AS SELECT * FROM p")
+
+for c in ["naive", "lgbm"]:
+    p["e_" + c] = (p.sales - p[c]).abs()
+g = p.groupby("h")
+print(pd.DataFrame({"WAPE_naive": g.e_naive.sum() / g.sales.sum(),
+                    "WAPE_lgbm":  g.e_lgbm.sum() / g.sales.sum()}).round(3))
+print("overall WAPE  naive:", round(p.e_naive.sum() / p.sales.sum(), 3),
+      " lgbm:", round(p.e_lgbm.sum() / p.sales.sum(), 3))
+===== train_quantile.py =====
+import duckdb, numpy as np, pandas as pd, lightgbm as lgb
+con = duckdb.connect("m5.duckdb")
+base = con.sql("SELECT id, wm_yr_wk, cutoff, h FROM preds_lgbm").df()
+
+FEATS = ["lag_r0", "lag_r1", "lag_r2", "lag_r3", "lag_r7", "lag_52",
+         "roll_mean_4", "roll_mean_12", "roll_std_12", "price", "price_ratio",
+         "snap_days", "has_event", "week_of_year", "store_id", "dept_id", "item_id"]
+CATS = ["store_id", "dept_id", "item_id"]
+ALPHAS = [0.5, 0.7, 0.9]
+QCOLS = [f"q{int(a*100)}" for a in ALPHAS]
+params = dict(learning_rate=0.05, num_leaves=63, min_data_in_leaf=100,
+              feature_fraction=0.8, verbose=-1)
+
+out = []
+for h in range(1, 5):
+    df = con.sql(f"SELECT * FROM features_h{h}").df()
+    for c in CATS:
+        df[c] = df[c].astype("category")
+    for T in sorted(base.cutoff.unique()):
+        keys = base[(base.cutoff == T) & (base.h == h)][["id", "wm_yr_wk"]]
+        train = df[df.wm_yr_wk <= T]
+        test = df.merge(keys, on=["id", "wm_yr_wk"])
+        ds = lgb.Dataset(train[FEATS], train.sales, categorical_feature=CATS, free_raw_data=False)
+        for a, col in zip(ALPHAS, QCOLS):
+            m = lgb.train({**params, "objective": "quantile", "alpha": a}, ds, num_boost_round=400)
+            test[col] = np.maximum(m.predict(test[FEATS]), 0)
+        test["cutoff"], test["h"] = T, h
+        out.append(test[["id", "wm_yr_wk", "cutoff", "h"] + QCOLS])
+        print(f"h={h} cutoff={T} done")
+
+q = pd.concat(out)
+q[QCOLS] = np.sort(q[QCOLS].values, axis=1)   # fix quantile crossing: q50 <= q70 <= q90
+con.execute("CREATE OR REPLACE TABLE preds_quantile AS SELECT * FROM q")
+print("rows:", len(q))   # must be 91956

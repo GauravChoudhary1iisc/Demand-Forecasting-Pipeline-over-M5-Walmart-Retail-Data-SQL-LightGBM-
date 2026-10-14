@@ -1,0 +1,16 @@
+rows: 91956
+q50: coverage 0.494 (target 0.5)  pinball 2.385
+q70: coverage 0.686 (target 0.7)  pinball 2.256
+q90: coverage 0.884 (target 0.9)  pinball 1.347
+
+cost per unit sold (lower is better)
+                      lgbm    ets    ens    q50    q70    q90
+shortage:holding                                             
+1:1 (optimal q50)    0.341  0.353  0.339  0.336  0.379  0.616
+2.3:1 (optimal q70)  0.589  0.612  0.587  0.608  0.530  0.672
+9:1 (optimal q90)    1.832  1.907  1.827  1.965  1.289  0.950
+
+fill rate / overstock (as share of sales)
+            lgbm    ets    ens    q50    q70    q90
+fill_rate  0.814  0.806  0.814  0.796  0.886  0.958
+overstock  0.155  0.159  0.153  0.133  0.265  0.574

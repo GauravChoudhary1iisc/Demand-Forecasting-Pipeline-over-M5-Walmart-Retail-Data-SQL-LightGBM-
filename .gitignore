@@ -2,5 +2,13 @@ data/
 *.duckdb
 duckdb
 .venv/
+.venv-airflow/
 __pycache__/
 interview_answer.md
+verification_report.txt
+mlflow.db
+mlruns/
+mlartifacts/
+.pytest_cache/
+monitoring/*.csv
+monitoring/*.md

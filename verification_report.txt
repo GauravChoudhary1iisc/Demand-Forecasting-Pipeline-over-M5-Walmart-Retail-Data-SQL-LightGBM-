@@ -1,0 +1,206 @@
+M5 DEMAND FORECASTING PROJECT: VERIFICATION REPORT
+==================================================
+Checked against code, SQL, saved logs (verification/*.log) and read-only queries on m5.duckdb.
+Nothing was retrained. There are no notebooks in the project.
+Status: VERIFIED / NOT FOUND / DIFFERENT / PARTIAL
+
+
+A. DATA AND SQL
+---------------
+1. Sales file: sales_train_evaluation.csv, filtered to CA + FOODS
+   Source: sql/01_build_weekly.sql lines 3-4            -> VERIFIED
+   Calendar and prices: calendar.csv, sell_prices.csv
+   Source: sql/01_build_weekly.sql lines 7-8            -> VERIFIED
+   Series: 5,748 (4 stores x 3 FOODS departments)
+   Source: DB query on sales_long / weekly              -> VERIFIED
+   Days: 1,941 days, 2011-01-29 to 2016-05-22
+   Source: DB query on sales_long + calendar            -> VERIFIED
+   Daily rows: 11,156,868 (~11.2M)
+   Source: DB query; build.py line 4                    -> VERIFIED
+   Weekly rows: 1,224,693 (~1.22M), 277 weeks
+   Source: DB query; build.py line 5                    -> VERIFIED
+
+2. What the SQL does
+   - Unpivot: wide d_1..d_1941 columns become long rows
+     Source: sql/01_build_weekly.sql lines 1-5          -> VERIFIED
+   - Joins: inner join to calendar on d; left join to prices on store + item + week
+     Source: sql/01_build_weekly.sql lines 18-21        -> VERIFIED
+   - Aggregation per series-week: SUM(sales), SUM(snap_CA),
+     MAX(event IS NOT NULL), ANY_VALUE(price)
+     Source: sql/01_build_weekly.sql lines 10-22        -> VERIFIED
+   - Cleaning: delete rows with price IS NULL (before launch) or n_days < 7 (partial week)
+     Source: sql/01_build_weekly.sql line 25            -> VERIFIED
+   - Gap check: 0 series have gaps
+     Source: check_gaps.py, verification/check_gaps.log -> VERIFIED
+   - Features: LAG at h, h+1, h+2, h+3, h+7, 52; 4- and 12-week rolling mean and
+     12-week rolling std ending at t-h; price_ratio = price / mean of previous
+     12 weeks; week_of_year
+     Source: sql/03_features_h.sql, templated by build_features_h.py line 5 -> VERIFIED
+
+   Key query (sql/03_features_h.sql):
+     LAG(sales, {h}) OVER w AS lag_r0, ... LAG(sales, 52) OVER w AS lag_52,
+     CASE WHEN COUNT(sales) OVER (w ROWS BETWEEN {h3} PRECEDING AND {h} PRECEDING) = 4
+          THEN AVG(sales) OVER (w ROWS BETWEEN {h3} PRECEDING AND {h} PRECEDING) END AS roll_mean_4,
+     ... WINDOW w AS (PARTITION BY id ORDER BY wm_yr_wk)
+
+3. Aggregation level: item x store x WEEK only. No store, department or total level.
+   Source: sql/01_build_weekly.sql line 11              -> VERIFIED
+
+
+B. VALIDATION
+-------------
+4. Number of cutoffs: 4 (the 17th, 13th, 9th and 5th weeks from the end)
+   Source: backtest_baselines.py line 7                 -> VERIFIED
+   Cutoff dates: weeks 11552, 11604, 11608, 11612,
+   ending 2016-01-29, 2016-02-26, 2016-03-25, 2016-04-22
+   Source: DB query on preds_baseline                   -> VERIFIED
+   Horizon: 1-4 WEEKS (7-28 days), not days. The model works in weeks.
+   Source: backtest_baselines.py line 6                 -> DIFFERENT if anyone says "days"
+   Training window: EXPANDING (train = df[df.wm_yr_wk <= T])
+   Source: train_lgbm.py line 19, train_quantile.py line 21, train_ets.py line 15 -> VERIFIED
+   Test rows: 91,956. Fold 1 has 5,745 series per horizon (3 weren't selling at
+   the cutoff); the other folds have 5,748.
+   Source: DB query                                     -> VERIFIED
+
+5. Leakage
+   - Sales lags and rolling features: all windows end at t-h or earlier, so
+     nothing comes after the cutoff
+     Source: sql/03_features_h.sql                      -> VERIFIED
+   - Price and SNAP/events: use target-week values. Fine only because M5
+     publishes them in advance
+     Source: sql/03_features_h.sql, README              -> VERIFIED (it's an assumption)
+   - price_ratio at h>1: its trailing window (lags 1-12 of price) includes prices
+     from weeks after the cutoff, so it relies on the same "price known in
+     advance" assumption
+     Source: sql/03_features_h.sql                      -> PARTIAL: say it relies on known prices
+   - MA(4)/MA(12) baselines: taken from the h=1 rolling mean, which ends exactly at T
+     Source: evaluate.py lines 9-11                     -> VERIFIED
+   - Zero-share segments: computed from history up to the first cutoff only
+     Source: evaluate.py line 16                        -> VERIFIED
+   - Leakage test: there is no automated assertion. The only checks are a manual
+     spot-check of lags (build_features.py) and row-count checks
+                                                        -> NOT FOUND as a formal test
+
+
+C. MODELS AND RESULTS
+---------------------
+6. Overall WAPE, then per cutoff (11552 / 11604 / 11608 / 11612)
+   Naive                    0.397   0.402 / 0.399 / 0.404 / 0.384
+     Source: verification/baselines.log lines 2-9, 12; evaluate.log line 14 -> VERIFIED
+   Seasonal naive           0.620   0.621 / 0.647 / 0.624 / 0.588
+     Source: verification/baselines.log lines 3-13      -> VERIFIED
+   MA(4) / MA(12)           0.363 / 0.399   MA(4): 0.368 / 0.369 / 0.358 / 0.357
+     Source: verification/evaluate.log lines 10-14      -> VERIFIED
+   AutoETS (season_length=1) 0.353  0.360 / 0.362 / 0.350 / 0.342
+     Source: train_ets.py line 16; evaluate.log lines 10-14 -> VERIFIED
+   LightGBM Tweedie         0.341   0.357 / 0.343 / 0.336 / 0.329
+     Source: verification/evaluate.log lines 10-14      -> VERIFIED
+   ETS + LightGBM average   0.339   0.349 / 0.341 / 0.336 / 0.328
+     Source: evaluate.py line 19; evaluate.log          -> VERIFIED
+   LightGBM quantile median (q50) 0.336   not saved per cutoff
+     Source: verification/cost.log, 1:1 cost row (equal to WAPE) -> VERIFIED overall only
+
+7. "0.397 -> 0.339": compares NAIVE with the ETS+LIGHTGBM ENSEMBLE.
+   Item-store-week level, pooled over all h=1-4 and all 4 cutoffs
+   (total absolute error / total sales, NOT a mean of the fold scores).
+   The naive mean over folds is also 0.397.
+   Source: evaluate.py lines 25-30
+   -> VERIFIED, but it isn't the best model. q50 reaches 0.336 (-15.4%).
+
+8. LightGBM details
+   - Features (17): lag_r0..r3, lag_r7, lag_52, roll_mean_4, roll_mean_12,
+     roll_std_12, price, price_ratio, snap_days, has_event, week_of_year,
+     store_id, dept_id, item_id (last 3 categorical)
+     Source: train_lgbm.py lines 5-8                    -> VERIFIED
+   - Hyperparameters: Tweedie objective, learning rate 0.05, num_leaves 63,
+     min_data_in_leaf 100, feature_fraction 0.8, 400 rounds, not tuned
+     Source: train_lgbm.py lines 9-10, 22               -> VERIFIED
+   - Early stopping: none (grep found nothing)          -> NOT FOUND
+   - Random seed: not set; LightGBM's built-in default seed is used
+     (grep found nothing)                               -> NOT FOUND
+   - Model count: 16 models (4 horizons x 4 cutoffs), one direct model per horizon
+     Source: train_lgbm.py loops                        -> VERIFIED
+
+
+D. QUANTILE FORECASTS AND NEWSVENDOR COST (all implemented)
+-----------------------------------------------------------
+9.  Quantiles: q50, q70, q90 from LightGBM objective="quantile", 48 models in
+    total. Crossing quantiles are fixed by sorting.
+    Source: train_quantile.py lines 9, 25, 32           -> VERIFIED
+10. Coverage: q50 = 0.494, q70 = 0.686, q90 = 0.884
+    (pinball loss 2.385 / 2.256 / 1.347)
+    Source: evaluate_cost.py line 17; verification/cost.log lines 2-4 -> VERIFIED
+11. Newsvendor cost: holding cost is 1 per leftover unit; shortage cost is
+    1, 7/3 or 9, which give critical ratios of 0.5 / 0.7 / 0.9
+    Source: evaluate_cost.py lines 22-28                -> VERIFIED
+    Source of the costs: ASSUMED, chosen to match the quantiles. They are not
+    real Walmart costs.
+    Source: evaluate_cost.py line 22                    -> VERIFIED (assumed)
+    Result: at 9:1, q90 costs 0.950 vs. 1.827 for the ensemble (-48%).
+            At 2.3:1, q70 costs 0.530 vs. 0.587 (-10%).
+            Fill rate is 81.4% -> 95.8%; overstock is 15.5% -> 57.4% of sales.
+    Source: verification/cost.log                       -> VERIFIED
+12. Nothing is missing. Items 9-11 all exist.
+
+
+E. OTHER
+--------
+13. Claims vs. code
+   - The README says "MAE, RMSE, and MASE are also reported by the scripts".
+     They're only computed for naive and seasonal naive
+     (backtest_baselines.py lines 9-14), not for ETS or LightGBM.
+                                                        -> DIFFERENT: README overstates
+   - "15% improvement" is right for the ensemble (-14.6%) and q50 (-15.4%).
+     It's only 3-5% against ETS.                        -> VERIFIED; quote both
+   - Code-backed work the claims don't mention: error analysis by segment
+     (intermittency, department, event, discount weeks), the bias metric,
+     error by horizon, the pinball loss, the quantile-crossing fix, the gap check.
+                                                        -> worth adding
+
+14. Weaknesses an interviewer could attack
+   1. The subset is small: 1 of 3 states and 1 of 3 categories, about 19% of
+      M5's 30,490 series.
+   2. Single level only: there's no hierarchy or reconciliation across store,
+      department or total.
+   3. The test window is short: 16 weeks in early 2016 with only 4 folds. It has
+      no holiday season and no confidence intervals or significance test on the
+      3% edge over ETS.
+   4. No tuning, early stopping or fixed seed, so the LightGBM result can't be
+      replicated exactly.
+   5. Future price and events are assumed known. That's realistic for M5 but not
+      for every retailer, and price_ratio at h>1 depends on it too.
+   6. No external features: no weather, no specific event types, no stock-out
+      signals. Zero sales could be a stock-out rather than zero demand, which
+      isn't handled.
+   7. The newsvendor costs are invented, and the comparison doesn't pad the point
+      forecast with safety stock.
+   8. No automated leakage test. The leak-free design follows from how the
+      windows are written, not from a test.
+
+
+SAFE TO SAY IN AN INTERVIEW
+---------------------------
+- "5,748 item-store series (CA, Foods), 1,941 days aggregated to 1.22M weekly
+  rows, with the pipeline in DuckDB SQL"
+- "Rolling-origin backtest with an expanding window: 4 cutoffs from Jan to
+  Apr 2016, horizons of 1-4 weeks, 91,956 forecasts"
+- "One direct model per horizon, so the model for horizon h never sees sales
+  after the cutoff"
+- "WAPE went from 0.397 (naive) to 0.339 (ETS+LightGBM ensemble) and 0.336
+  (LightGBM median), about 15%. Against ETS the gain is only about 3%"
+- "LightGBM quantile models were well calibrated: coverage 0.494 / 0.686 / 0.884
+  for q50 / q70 / q90"
+- "Under an assumed 9:1 shortage-to-holding cost, the q90 forecast cut
+  newsvendor cost by 48% compared with the best point forecast"
+
+
+DO NOT CLAIM
+------------
+- That the horizon was in days, or that you forecast daily sales
+- Hierarchical or multi-level forecasting, or reconciliation
+- Hyperparameter tuning, early stopping, or reproducible seeds
+- MAE, RMSE or MASE for ETS or LightGBM (only the baselines have them)
+- That the 0.339 model was the best (q50 at 0.336 was)
+- Real business costs. Say "assumed cost ratios"
+- That leakage was tested automatically. Say "leakage-safe by design"
+- Full-M5 or all-store results

@@ -1,0 +1,6 @@
+[tool.ruff]
+line-length = 120
+exclude = [".venv", "mlruns", "airflow"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]  # syntax errors and pyflakes only; keep existing code style untouched
